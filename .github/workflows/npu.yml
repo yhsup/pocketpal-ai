@@ -1,0 +1,204 @@
+name: Build Android APK (HF mirror + Hexagon NPU)
+
+# 骁龙 8 至尊版 NPU (Hexagon HTP) 构建。
+# 前置：PocketPal/llama.rn 的 Hexagon 后端需要「现代、带 HTP 运行时的 SDK」，
+# 而非老版 2.x/3.x（那些只做 DSP offload，没有 NPU，编出来也是 CPU-only）。
+# 这里用 snapdragon-toolchain 把现代 Hexagon SDK 重打包后公开托管在 GitHub 的
+# Community Edition，无需高通账号即可在 CI 拉取（llama.cpp 官方推荐的同款工具链）。
+#
+# 关键机制（来自 llama.rn 0.13.0-rc.0 android/build.gradle）：
+#   1. 必须同时满足两个环境变量指向「已存在」的目录，才会启用 DSP 构建：
+#        HEXAGON_SDK_ROOT  和  HEXAGON_TOOLS_ROOT
+#   2. 必须开启源码构建：gradle 属性 rnllamaBuildFromSource=true
+#      （预编译 jniLibs 路径里不含任何 Hexagon 库，所以一定要走源码编译）
+#   3. 成功标志（构建日志）：
+#        ✅ Hexagon SDK detected — enabling DSP build
+#      且产物会进 android/app/src/main/assets/ggml-hexagon/
+#      （libggml-hexagon.so、libggml-htp-v*.so）
+#
+# 说明：本工作流用「Release 重打包 SDK 压缩包」而非 Docker 镜像，原因见下——
+# snapdragon-toolchain/arm64-android 是 arm64 镜像，适合本机 Apple Silicon 开发，
+# 在 GitHub 的 x86_64 runner 上跑需要 QEMU 仿真、极慢；用压缩包 + NDK 交叉编译
+# arm64 .so 才是 CI 里能跑通的路径。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 源码编译 llama.cpp + Hexagon 后端在 2 核机器上较慢，给足超时。
+    timeout-minutes: 180
+    env:
+      # 免费版只能 2 vCPU / 7GB。Gradle 调优：构建缓存 + 并行 + 4G daemon 堆。
+      GRADLE_OPTS: >-
+        -Dorg.gradle.daemon=false
+        -Dorg.gradle.caching=true
+        -Dorg.gradle.parallel=true
+        -Dorg.gradle.workers.max=2
+        -Xmx4g
+        -XX:MaxMetaspaceSize=1g
+      # 跳过 llama.rn 的预编译 jniLibs 下载（我们要源码编译，且能省时间）。
+      # 若变量名在将来版本变了，postinstall 照常下载也不影响——只是多花点时间。
+      RNLLAMA_SKIP_POSTINSTALL: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 把「改好的完整源文件」解压覆盖到仓库（HF 镜像逻辑在运行时生效）。
+      # hf-mirror-files.zip 需随本仓库一起提交在根目录。
+      - name: Apply HF mirror source overrides
+        run: unzip -o hf-mirror-files.zip -d .
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.0'
+          cache: yarn
+
+      # —— 下载重打包的 Hexagon SDK (Community Edition) ——
+      # TODO: 建议把版本钉死，避免上游改结构导致断构建：
+      #   在下面 gh release download 加上  -t <tag>  （如 -t v6.x.x）
+      # 公开 Release 资产下载用 github.token 即可（匿名易被限流）。
+      - name: Download repackaged Hexagon SDK (Community Edition)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/hsdk
+          gh release download -R snapdragon-toolchain/hexagon-sdk \
+            -p '*.tar.gz' -p '*.tgz' -D /tmp/hsdk
+          ls -la /tmp/hsdk
+
+      # —— 解压并探测两个必需路径 ——
+      # 打包结构是 Hexagon_SDK/<版本>/，tools 在 <SDK>/tools/HEXAGON_Tools/<工具版本>/。
+      # 动态探测，避免把版本号写死。两个目录都必须存在，否则 Gradle 会判为「未找到」。
+      - name: Extract & locate Hexagon SDK roots
+        id: hsdk
+        run: |
+          mkdir -p /opt/hexagon-sdk
+          tar -xzf /tmp/hsdk/*.tar.gz -C /opt/hexagon-sdk 2>/dev/null || \
+          tar -xzf /tmp/hsdk/*.tgz  -C /opt/hexagon-sdk 2>/dev/null
+          # 找到 Hexagon_SDK/<版本> 这一层
+          SDK_ROOT=$(find /opt/hexagon-sdk -maxdepth 3 -type d -path '*Hexagon_SDK/*' | head -1)
+          # 找到 HEXAGON_Tools/<工具版本>
+          TOOLS_ROOT=$(find "$SDK_ROOT/tools/HEXAGON_Tools" -maxdepth 1 -type d 2>/dev/null | tail -1)
+          echo "SDK_ROOT=$SDK_ROOT"
+          echo "TOOLS_ROOT=$TOOLS_ROOT"
+          if [ ! -d "$SDK_ROOT" ] || [ ! -d "$TOOLS_ROOT" ]; then
+            echo "::error::未找到 Hexagon SDK 根目录或 HEXAGON_Tools，解压结构可能变了。请检查 /opt/hexagon-sdk 布局。"
+            find /opt/hexagon-sdk -maxdepth 3 -type d | head -40
+            exit 1
+          fi
+          # 写入后续步骤的环境变量
+          {
+            echo "HEXAGON_SDK_ROOT=$SDK_ROOT"
+            echo "HEXAGON_TOOLS_ROOT=$TOOLS_ROOT"
+          } >> "$GITHUB_ENV"
+
+      # 把 HF 下载域名切到国内镜像（要换镜像改这一行）。
+      - name: Create .env (HF mirror + required keys)
+        run: |
+          cat > .env <<'EOL'
+          HF_MIRROR_URL=https://hf-mirror.com
+
+          FIREBASE_FUNCTIONS_URL=
+          SUPABASE_URL=https://your-project.supabase.co
+          SUPABASE_ANON_KEY=your-anon-key
+          PALSHUB_API_BASE_URL=https://palshub.ai
+          APP_URL=pocketpal://app
+          ENABLE_PALSHUB_INTEGRATION=true
+          ENABLE_AUTHENTICATION=true
+          ENABLE_OFFLINE_MODE=true
+          GOOGLE_IOS_CLIENT_ID=
+          GOOGLE_WEB_CLIENT_ID=
+          EOL
+
+      # google-services.json 不在仓库里但构建强制需要，放占位文件让插件通过。
+      - name: Create stub google-services.json
+        run: |
+          cat > android/app/google-services.json <<'EOL'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "pocketpal-mirror",
+              "storage_bucket": "pocketpal-mirror.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": { "package_name": "com.pocketpalai" }
+                },
+                "oauth_client": [],
+                "api_key": [{ "current_key": "AIzaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMY" }],
+                "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOL
+
+      # 缓存 Gradle / NDK（NDK 27 由 gradle 自动接受+下载；源码编译需要它）。
+      - name: Cache Gradle & NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/build-cache-1
+            /usr/local/lib/android/sdk/ndk
+          key: ${{ runner.os }}-gradle-ndk-npu-${{ hashFiles('android/**/*.gradle', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-ndk-npu-
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # 关键：用 -PrnllamaBuildFromSource=true 开启源码编译，
+      # 配合上面的 HEXAGON_SDK_ROOT / HEXAGON_TOOLS_ROOT 环境变量，
+      # Gradle 才会打出 Hexagon DSP 后端（日志出现 ✅ Hexagon SDK detected）。
+      # 仅 arm64-v8a + 构建缓存 + 跳过 lint/test，最大化免费机器利用率。
+      - name: Build APK (prodDebug, with Hexagon)
+        working-directory: android
+        run: |
+          ./gradlew assembleProdDebug --no-daemon --build-cache \
+            -PreactNativeArchitectures=arm64-v8a \
+            -PrnllamaBuildFromSource=true \
+            -x lint -x test
+          echo "=== 构建日志若含 ✅ Hexagon SDK detected 即成功 ==="
+
+      # 校验：Hexagon 库必须被打进 APK assets，否则 NPU 后端在 App 里用不了。
+      - name: Verify Hexagon libs bundled
+        run: |
+          DIR=android/app/src/main/assets/ggml-hexagon
+          if [ -d "$DIR" ] && ls "$DIR"/libggml-hexagon.so "$DIR"/libggml-htp-v*.so >/dev/null 2>&1; then
+            echo "✅ NPU 库已打进 APK assets："; ls -la "$DIR"
+          else
+            echo "::error::未找到 Hexagon 库（libggml-hexagon.so / libggml-htp-v*.so）。"
+            echo "请检查上面的构建日志是否出现 '✅ Hexagon SDK detected'；"
+            echo "若仍是 '🚫 Hexagon SDK not found'，说明 HEXAGON_SDK_ROOT/HEXAGON_TOOLS_ROOT 未命中。"
+            ls -la "$DIR" 2>/dev/null || echo "(目录不存在)"
+            exit 1
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocketpal-android-apk-npu
+          path: android/app/build/outputs/apk/prod/debug/*.apk
+          if-no-files-found: error
