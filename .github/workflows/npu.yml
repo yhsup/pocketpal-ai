@@ -72,35 +72,42 @@ jobs:
           cache: yarn
 
       # —— 下载重打包的 Hexagon SDK (Community Edition) ——
-      # TODO: 建议把版本钉死，避免上游改结构导致断构建：
-      #   在下面 gh release download 加上  -t <tag>  （如 -t v6.x.x）
-      # 公开 Release 资产下载用 github.token 即可（匿名易被限流）。
+      # 资产命名形如 hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz（x86_64 Linux runner 用这个）
+      # 与 hexagon-sdk-v6.6.0.0-arm64-wos.tar.xz（Windows-on-Snapdragon，用不到）。
+      # 这里钉死版本 + 只取 amd64-lnx，避免误拉 arm64 包或上游更新后断构建。
+      # 想换版本：把下面 -t 的 tag 改成 v6.4.0.2 等（数字越大通常架构支持越新，
+      # 骁龙 8 至尊版的 v81 建议用较新的 6.6.0.0）。公开资产下载用 github.token 即可。
       - name: Download repackaged Hexagon SDK (Community Edition)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/hsdk
-          gh release download -R snapdragon-toolchain/hexagon-sdk \
-            -p '*.tar.gz' -p '*.tgz' -D /tmp/hsdk
+          gh release download -R snapdragon-toolchain/hexagon-sdk -t v6.6.0.0 \
+            -p 'hexagon-sdk-*-amd64-lnx.tar.xz' -D /tmp/hsdk
           ls -la /tmp/hsdk
 
       # —— 解压并探测两个必需路径 ——
-      # 打包结构是 Hexagon_SDK/<版本>/，tools 在 <SDK>/tools/HEXAGON_Tools/<工具版本>/。
-      # 动态探测，避免把版本号写死。两个目录都必须存在，否则 Gradle 会判为「未找到」。
+      # 资产是 .tar.xz（用 tar -xf 自动识别压缩格式）。压缩包顶层为 Hexagon_SDK/<版本>/，
+      # 工具在 <SDK>/tools/HEXAGON_Tools/<工具版本>/。
+      # 路径探测以 HEXAGON_Tools 目录为锚反向推算，对压缩包内部结构变化更鲁棒。
       - name: Extract & locate Hexagon SDK roots
         id: hsdk
         run: |
           mkdir -p /opt/hexagon-sdk
-          tar -xzf /tmp/hsdk/*.tar.gz -C /opt/hexagon-sdk 2>/dev/null || \
-          tar -xzf /tmp/hsdk/*.tgz  -C /opt/hexagon-sdk 2>/dev/null
-          # 找到 Hexagon_SDK/<版本> 这一层
-          SDK_ROOT=$(find /opt/hexagon-sdk -maxdepth 3 -type d -path '*Hexagon_SDK/*' | head -1)
-          # 找到 HEXAGON_Tools/<工具版本>
-          TOOLS_ROOT=$(find "$SDK_ROOT/tools/HEXAGON_Tools" -maxdepth 1 -type d 2>/dev/null | tail -1)
+          tar -xf /tmp/hsdk/*.tar.xz -C /opt/hexagon-sdk
+          # 找到 HEXAGON_Tools 目录，反向推出 SDK 根与工具版本目录
+          TOOLS_DIR=$(find /opt/hexagon-sdk -type d -name HEXAGON_Tools 2>/dev/null | head -1)
+          if [ -z "$TOOLS_DIR" ]; then
+            echo "::error::未找到 HEXAGON_Tools 目录，压缩包内部结构可能变了。请检查 /opt/hexagon-sdk 布局。"
+            find /opt/hexagon-sdk -maxdepth 3 -type d | head -40
+            exit 1
+          fi
+          SDK_ROOT=$(dirname "$(dirname "$TOOLS_DIR")")   # .../tools/HEXAGON_Tools -> SDK 根
+          TOOLS_ROOT=$(find "$TOOLS_DIR" -maxdepth 1 -type d 2>/dev/null | tail -1)  # 版本子目录
           echo "SDK_ROOT=$SDK_ROOT"
           echo "TOOLS_ROOT=$TOOLS_ROOT"
           if [ ! -d "$SDK_ROOT" ] || [ ! -d "$TOOLS_ROOT" ]; then
-            echo "::error::未找到 Hexagon SDK 根目录或 HEXAGON_Tools，解压结构可能变了。请检查 /opt/hexagon-sdk 布局。"
+            echo "::error::SDK 根目录或 HEXAGON_Tools 探测失败。请检查 /opt/hexagon-sdk 布局。"
             find /opt/hexagon-sdk -maxdepth 3 -type d | head -40
             exit 1
           fi
