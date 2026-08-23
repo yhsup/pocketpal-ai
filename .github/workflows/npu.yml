@@ -1,5 +1,11 @@
-name: Build Android APK (HF mirror + Hexagon NPU)
+name: Build Android APK (HF mirror + Hexagon NPU) [v1.0.0]
 
+# ============================================================================
+# 工作流版本: 1.0.0
+# 版本规则：每次修改本文件后，请把版本号 +0.0.1（如 1.0.0 -> 1.0.1）。
+#           版本号同时体现在上面的 name 字段与本注释中，便于追溯。
+# ============================================================================
+#
 # 骁龙 8 至尊版 NPU (Hexagon HTP) 构建。
 # 前置：PocketPal/llama.rn 的 Hexagon 后端需要「现代、带 HTP 运行时的 SDK」，
 # 而非老版 2.x/3.x（那些只做 DSP offload，没有 NPU，编出来也是 CPU-only）。
@@ -75,14 +81,14 @@ jobs:
       # 资产命名形如 hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz（x86_64 Linux runner 用这个）
       # 与 hexagon-sdk-v6.6.0.0-arm64-wos.tar.xz（Windows-on-Snapdragon，用不到）。
       # 这里钉死版本 + 只取 amd64-lnx，避免误拉 arm64 包或上游更新后断构建。
-      # 想换版本：把下面 -t 的 tag 改成 v6.4.0.2 等（数字越大通常架构支持越新，
+      # 想换版本：把下面 v6.6.0.0 改成 v6.4.0.2 等（数字越大通常架构支持越新，
       # 骁龙 8 至尊版的 v81 建议用较新的 6.6.0.0）。公开资产下载用 github.token 即可。
       - name: Download repackaged Hexagon SDK (Community Edition)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/hsdk
-          gh release download -R snapdragon-toolchain/hexagon-sdk -t v6.6.0.0 \
+          gh release download v6.6.0.0 -R snapdragon-toolchain/hexagon-sdk \
             -p 'hexagon-sdk-*-amd64-lnx.tar.xz' -D /tmp/hsdk
           ls -la /tmp/hsdk
 
@@ -209,4 +215,3 @@ jobs:
           name: pocketpal-android-apk-npu
           path: android/app/build/outputs/apk/prod/debug/*.apk
           if-no-files-found: error
-
