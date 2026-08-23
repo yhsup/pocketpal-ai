@@ -1,12 +1,12 @@
 name: CI Pipeline
 
 on:
-  pull_request:
-    branches:
-      - main
+  #pull_request:
+    #branches:
+      #- main
   push:
-    branches:
-      - main
+    #branches:
+      #- main
 
 permissions:
   contents: read
